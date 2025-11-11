@@ -152,14 +152,20 @@ impl Client {
         let server = server_url
             .map(|s| s.to_string())
             .or_else(|| std::env::var("MODAL_SERVER_URL").ok())
-            .unwrap_or_else(|| "https://api.modal.com:443".to_string());
+            .unwrap_or_else(|| "https://api.modal.com".to_string());
 
         // Ensure the URL has a scheme
-        let server = if !server.starts_with("http://") && !server.starts_with("https://") {
+        let mut server = if !server.starts_with("http://") && !server.starts_with("https://") {
             format!("https://{}", server)
         } else {
             server
         };
+
+        // Remove explicit :443 port for HTTPS (it's the default)
+        // This matches how Go client handles it - they strip the scheme and use just host:port
+        if server.ends_with(":443") && server.starts_with("https://") {
+            server = server.strip_suffix(":443").unwrap().to_string();
+        }
 
         let endpoint = Endpoint::from_shared(server.clone())?
             .timeout(Duration::from_secs(30))
