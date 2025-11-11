@@ -166,7 +166,11 @@ impl Client {
             .connect_timeout(Duration::from_secs(10));
         let channel = endpoint.connect().await?;
 
-        let stub = ModalClientClient::new(channel);
+        // Set message size limits to 100 MB (matching Go/JS implementations)
+        const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024; // 100 MB
+        let stub = ModalClientClient::new(channel)
+            .max_decoding_message_size(MAX_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_MESSAGE_SIZE);
 
         // Validate that we have credentials
         let final_token_id = token_id
