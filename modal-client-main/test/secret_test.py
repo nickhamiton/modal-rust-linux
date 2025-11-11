@@ -1,0 +1,164 @@
+# Copyright Modal Labs 2022
+import os
+import pytest
+import sys
+import tempfile
+import time
+from unittest import mock
+
+from modal import App, Sandbox, Secret
+from modal.exception import AlreadyExistsError, DeprecationError, InvalidError, NotFoundError
+from modal_proto import api_pb2
+
+from .supports.skip import skip_old_py, skip_windows
+
+
+def dummy(): ...
+
+
+def test_secret_from_dict(servicer, client):
+    app = App(include_source=False)
+    secret = Secret.from_dict({"FOO": "hello, world"})
+    app.function(secrets=[secret])(dummy)
+    with app.run(client=client):
+        assert secret.object_id == "st-0"
+        assert servicer.secrets["st-0"] == {"FOO": "hello, world"}
+
+
+@skip_old_py("python-dotenv requires python3.8 or higher", (3, 8))
+def test_secret_from_dotenv(servicer, client):
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        with open(os.path.join(tmpdirname, ".env"), "w") as f:
+            f.write("# My settings\nUSER=user\nPASSWORD=abc123\n")
+
+        with open(os.path.join(tmpdirname, ".env-dev"), "w") as f:
+            f.write("# My settings\nUSER=user2\nPASSWORD=abc456\n")
+
+        app = App(include_source=False)
+        secret = Secret.from_dotenv(tmpdirname)
+        app.function(secrets=[secret])(dummy)
+        with app.run(client=client):
+            assert secret.object_id == "st-0"
+            assert servicer.secrets["st-0"] == {"USER": "user", "PASSWORD": "abc123"}
+
+        app = App(include_source=False)
+        secret = Secret.from_dotenv(tmpdirname, filename=".env-dev")
+        app.function(secrets=[secret])(dummy)
+        with app.run(client=client):
+            assert secret.object_id == "st-1"
+            assert servicer.secrets["st-1"] == {"USER": "user2", "PASSWORD": "abc456"}
+
+
+@skip_windows("uses sandbox to repro app-ness of secret, and sandboxe tests use subprocess")
+def test_secret_from_dotenv_lazy(client, servicer):
+    with servicer.intercept() as ctx:
+        dummy_app = App.lookup("blah", client=client, create_if_missing=True)
+        Sandbox.create(client=client, secrets=[Secret.from_dotenv()], app=dummy_app)
+        req = ctx.pop_request("SecretGetOrCreate")
+        assert (
+            req.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_ANONYMOUS_OWNED_BY_APP
+        )  # use the sandbox's app id
+        assert req.app_id == dummy_app.app_id
+
+        ctx.calls.clear()
+
+        Secret.from_dotenv(client=client).hydrate()
+        req = ctx.pop_request("SecretGetOrCreate")
+        # there is no app in this case - not sure if this should be allowed long term...
+        assert req.object_creation_type == api_pb2.OBJECT_CREATION_TYPE_EPHEMERAL
+
+
+@mock.patch.dict(os.environ, {"FOO": "easy", "BAR": "1234"})
+def test_secret_from_local_environ(servicer, client):
+    app = App(include_source=False)
+    secret = Secret.from_local_environ(["FOO", "BAR"])
+    app.function(secrets=[secret])(dummy)
+    with app.run(client=client):
+        assert secret.object_id == "st-0"
+        assert servicer.secrets["st-0"] == {"FOO": "easy", "BAR": "1234"}
+
+    with pytest.raises(InvalidError, match="NOTFOUND"):
+        Secret.from_local_environ(["FOO", "NOTFOUND"])
+
+
+def test_init_types():
+    with pytest.raises(InvalidError):
+        Secret.from_dict({"foo": 1.0})  # type: ignore
+
+
+def test_secret_from_dict_none(servicer, client):
+    app = App(include_source=False)
+    secret = Secret.from_dict({"FOO": os.getenv("xyz"), "BAR": os.environ.get("abc"), "BAZ": "baz"})
+    app.function(secrets=[secret])(dummy)
+    with app.run(client=client):
+        assert servicer.secrets["st-0"] == {"BAZ": "baz"}
+
+
+def test_secret_from_name(servicer, client):
+    # Deploy secret
+    name = "my-secret"
+    Secret.objects.create(name, {"FOO": "123"}, client=client)
+
+    # Look up secret
+    secret = Secret.from_name(name)
+    assert secret.name == name
+    secret.hydrate(client)
+    secret_id = secret.object_id
+
+    info = secret.info()
+    assert info.name == name
+    assert info.created_by == servicer.default_username
+
+    # Look up secret through app
+    app = App()
+    secret = Secret.from_name("my-secret")
+    app.function(secrets=[secret])(dummy)
+    with app.run(client=client):
+        assert secret.object_id == secret_id
+
+    Secret.objects.delete("my-secret", client=client)
+    with pytest.raises(NotFoundError):
+        Secret.from_name("my-secret").hydrate(client)
+    Secret.objects.delete("my-secret", client=client, allow_missing=True)
+
+
+def test_secret_namespace_deprecated(servicer, client):
+    with pytest.warns(
+        DeprecationError,
+        match="The `namespace` parameter for `modal.Secret.from_name` is deprecated",
+    ):
+        Secret.from_name("my-secret", namespace=api_pb2.DEPLOYMENT_NAMESPACE_WORKSPACE)
+
+    with pytest.warns(
+        DeprecationError,
+        match="The `namespace` parameter for `modal.Secret.create_deployed` is deprecated",
+    ):
+        Secret._create_deployed(
+            "my-secret", {"FOO": "123"}, namespace=api_pb2.DEPLOYMENT_NAMESPACE_WORKSPACE, client=client
+        )
+
+    with pytest.warns(DeprecationError, match="The `namespace` parameter"):
+        Secret.from_name("my-secret", namespace=api_pb2.DEPLOYMENT_NAMESPACE_WORKSPACE)
+
+
+def test_secret_list(servicer, client):
+    for i in range(5):
+        Secret.objects.create(f"test-secret-{i}", {"FOO": "123"}, client=client)
+    if sys.platform == "win32":
+        time.sleep(1 / 32)
+
+    secrets = Secret.objects.list(client=client)
+    assert len(secrets) == 5
+    assert all(s.name.startswith("test-secret-") for s in secrets)
+    assert all(s.info().created_by == servicer.default_username for s in secrets)
+
+
+def test_secret_create(servicer, client):
+    env_dict = {"FOO": "123"}
+    Secret.objects.create(name="test-secret-create", env_dict=env_dict, client=client)
+    Secret.from_name("test-secret-create").hydrate(client)
+    with pytest.raises(AlreadyExistsError):
+        Secret.objects.create(name="test-secret-create", env_dict=env_dict, client=client)
+    Secret.objects.create(name="test-secret-create", env_dict=env_dict, allow_existing=True, client=client)
+    with pytest.raises(InvalidError, match="Invalid Secret name"):
+        Secret.objects.create(name="has space", env_dict=env_dict, client=client)

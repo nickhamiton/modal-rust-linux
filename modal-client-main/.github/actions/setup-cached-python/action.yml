@@ -1,0 +1,29 @@
+name: setup-cached-python
+
+inputs:
+  version:
+    description: Which Python version to install
+    required: true
+    default: "3.9"
+
+runs:
+  using: composite
+  steps:
+    - name: Install Python
+      uses: actions/setup-python@8d9ed9ac5c53483de85588cdf95a591a75ab9f55 # v5
+      with:
+        python-version: ${{ inputs.version }}
+
+    - name: Setup uv with caching
+      uses: astral-sh/setup-uv@85856786d1ce8acfbcc2f13a5f3fbd6b938f9f41 # v7.1.2
+      with:
+        enable-cache: true
+        version: "0.9.7"
+        cache-dependency-glob: |
+          requirements.dev.txt
+          pyproject.toml
+
+    - name: Install Python packages
+      shell: bash
+      run: |
+        uv pip install --system -r requirements.dev.txt
